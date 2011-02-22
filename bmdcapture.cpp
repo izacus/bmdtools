@@ -63,6 +63,7 @@ AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
 AVStream *audio_st, *video_st;
 BMDTimeValue frameRateDuration, frameRateScale;
+int serial_fd = -1;
 
 
 static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id)
@@ -237,6 +238,12 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
             pthread_cond_signal(&sleepCond);
         }
     }
+    if (serial_fd) {
+        char line[8] = {0};
+        int count = read(serial_fd, line, 7);
+        if (count > 0)
+            fprintf(stderr, "read %d bytes: %s\n", count, line);
+    }
 
     // Handle Audio Frame
     if (audioFrame)
@@ -351,7 +358,7 @@ int main(int argc, char *argv[])
         goto bail;
     }
     // Parse command line options
-    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:F:C:I:")) != -1)
+    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:F:C:I:S:")) != -1)
     {
         switch (ch)
         {
@@ -391,6 +398,9 @@ int main(int argc, char *argv[])
 	    case 'C':
 		camera = atoi(optarg);
 		break;
+            case 'S':
+                serial_fd = open(optarg, O_RDWR | O_NONBLOCK);
+                break;
             case '?':
             case 'h':
                 usage(0);
