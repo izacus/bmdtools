@@ -58,10 +58,12 @@ static int                        g_maxFrames = -1;
 
 static unsigned long             frameCount = 0;
 
-AVFrame *picture;
+AVFrame *picture, *fake_picture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
-AVStream *audio_st, *video_st;
+AVStream *audio_st, *video_st, *data_st;
+uint8_t *video_outbuf;
+int video_outbuf_size;
 BMDTimeValue frameRateDuration, frameRateScale;
 int serial_fd = -1;
 
@@ -122,19 +124,12 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
     c->codec_id = codec_id;
     c->codec_type = AVMEDIA_TYPE_VIDEO;
 
-    /* put sample parameters */
-//    c->bit_rate = 400000;
-    /* resolution must be a multiple of two */
     c->width = displayMode->GetWidth();
     c->height = displayMode->GetHeight();
-    /* time base: this is the fundamental unit of time (in seconds) in terms
-       of which frame timestamps are represented. for fixed-fps content,
-       timebase should be 1/framerate and timestamp increments should be
-       identically 1.*/
+
     displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
     c->time_base.den = frameRateScale;
     c->time_base.num = frameRateDuration;
-//    c->gop_size = 12; /* emit one intra frame every twelve frames at most */
     c->pix_fmt = PIX_FMT_UYVY422;
 
     // some formats want stream headers to be separate
@@ -157,6 +152,69 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
 
     return st;
 }
+
+static AVStream *add_data_stream(AVFormatContext *oc, enum CodecID codec_id)
+{
+    AVCodecContext *c;
+    AVCodec *codec;
+    AVStream *st;
+
+    st = av_new_stream(oc, 0);
+    if (!st) {
+        fprintf(stderr, "Could not alloc stream\n");
+        exit(1);
+    }
+
+    c = st->codec;
+    c->codec_id = codec_id;
+    c->codec_type = AVMEDIA_TYPE_VIDEO;
+
+    c->bit_rate = 400000;
+    /* resolution must be a multiple of two */
+    c->width = 16;
+    c->height = 16;
+    c->width = displayMode->GetWidth();
+    c->height = displayMode->GetHeight();
+
+    displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
+    c->time_base.den = frameRateScale;
+    c->time_base.num = frameRateDuration;
+
+    c->pix_fmt = PIX_FMT_YUV420P;
+    c->max_b_frames = 0;
+    c->has_b_frames = 0;
+
+    if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+       // some formats want stream headers to be separate
+    if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+    /* find the video encoder */
+    codec = avcodec_find_encoder(c->codec_id);
+    if (!codec) {
+        fprintf(stderr, "codec not found\n");
+        exit(1);
+    }
+
+    /* open the codec */
+    if (avcodec_open(c, codec) < 0) {
+        fprintf(stderr, "could not open codec\n");
+        exit(1);
+    }
+
+    fake_picture = avcodec_alloc_frame();
+    int size = avpicture_get_size(c->pix_fmt, c->width,c->height);
+    uint8_t *fake_picture_ptr = (uint8_t *)av_malloc(size);
+    memset(fake_picture_ptr, 0, size);
+    avpicture_fill((AVPicture *)fake_picture, fake_picture_ptr,
+                   c->pix_fmt, c->width,c->height);
+    video_outbuf_size = size;
+    video_outbuf = (uint8_t *)av_malloc(video_outbuf_size);
+    return st;
+}
+
 
 DeckLinkCaptureDelegate::DeckLinkCaptureDelegate() : m_refCount(0)
 {
@@ -229,6 +287,30 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
 	    //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
 	    c->frame_number++;
             av_interleaved_write_frame(oc, &pkt);
+
+            if (serial_fd>0) {
+                c = data_st->codec;
+                int out_size = avcodec_encode_video(c, video_outbuf,
+                                             video_outbuf_size, fake_picture);
+                av_init_packet(&pkt);
+                pkt.flags |= AV_PKT_FLAG_KEY;
+                pkt.stream_index= data_st->index;
+                pkt.data = video_outbuf;
+                pkt.size = out_size;
+                char line[9] = {0};
+                int count = read(serial_fd, line, 8);
+                if (count > 0) {
+                    fprintf(stderr, "read %d bytes: %s\n", count, line);
+                } else {
+                    fprintf(stderr, "nothing\n");
+                }
+                memcpy(pkt.data+out_size, line, 8);
+                pkt.size += 8;
+
+                c->frame_number++;
+                av_interleaved_write_frame(oc, &pkt);
+            }
+
             //write(videoOutputFile, frameBytes, videoFrame->GetRowBytes() * videoFrame->GetHeight());
         }
         frameCount++;
@@ -237,12 +319,6 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
         {
             pthread_cond_signal(&sleepCond);
         }
-    }
-    if (serial_fd) {
-        char line[8] = {0};
-        int count = read(serial_fd, line, 7);
-        if (count > 0)
-            fprintf(stderr, "read %d bytes: %s\n", count, line);
     }
 
     // Handle Audio Frame
@@ -493,6 +569,7 @@ int main(int argc, char *argv[])
 
     video_st = add_video_stream(oc, fmt->video_codec);
     audio_st = add_audio_stream(oc, fmt->audio_codec);
+    data_st = add_data_stream(oc, CODEC_ID_MPEG2VIDEO); //fake stream.
 
     av_set_parameters(oc, NULL);
 
