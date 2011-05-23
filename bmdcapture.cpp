@@ -182,8 +182,9 @@ static int avpacket_queue_size(AVPacketQueue *q)
 AVFrame *picture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
-AVStream *audio_st, *video_st;
+AVStream *audio_st, *video_st, *data_st = NULL;
 BMDTimeValue frameRateDuration, frameRateScale;
+int serial_fd = -1;
 
 
 static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id)
@@ -276,6 +277,40 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
     return st;
 }
 
+static AVStream *add_data_stream(AVFormatContext *oc, enum CodecID codec_id)
+{
+    AVCodec *codec;
+    AVCodecContext *c;
+    AVStream *st;
+
+    st = av_new_stream(oc, 0);
+    if (!st) {
+        fprintf(stderr, "Could not alloc stream\n");
+        exit(1);
+    }
+
+    c = st->codec;
+    c->codec_id = codec_id;
+    c->codec_type = AVMEDIA_TYPE_DATA;
+
+    c->time_base.den = STREAM_FRAME_RATE;
+    c->time_base.num = 1;
+
+    // some formats want stream headers to be separate
+    if(oc->oformat->flags & AVFMT_GLOBALHEADER)
+        c->flags |= CODEC_FLAG_GLOBAL_HEADER;
+
+    /* find the video encoder */
+    codec = av_malloc(sizeof(AVCodec));
+    memset(codec, 0, sizeof(AVCodec));
+    codec->id = c->codec_id;
+
+    /* open the codec */
+    c->codec = codec;
+
+    return st;
+}
+
 DeckLinkCaptureDelegate::DeckLinkCaptureDelegate() : m_refCount(0)
 {
     pthread_mutex_init(&m_mutex, NULL);
@@ -357,6 +392,19 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
         {
             pthread_cond_signal(&sleepCond);
         }
+    }
+    if (serial_fd > 0) {
+        char line[8] = {0};
+        int count = read(serial_fd, line, 7);
+        if (count > 0)
+            fprintf(stderr, "read %d bytes: %s\n", count, line);
+        av_init_packet(&pkt);
+        pkt.flags |= AV_PKT_FLAG_KEY;
+        pkt.stream_index= data_st->index;
+        pkt.data = line;
+        pkt.size = 7;
+        c->frame_number++;
+        avpacket_queue_put(&queue, &pkt);
     }
 
     // Handle Audio Frame
@@ -591,7 +639,7 @@ int main(int argc, char *argv[])
         goto bail;
     }
     // Parse command line options
-    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:F:C:I:")) != -1)
+    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:F:C:I:S:")) != -1)
     {
         switch (ch)
         {
@@ -631,6 +679,9 @@ int main(int argc, char *argv[])
 	    case 'C':
 		camera = atoi(optarg);
 		break;
+            case 'S':
+                serial_fd = open(optarg, O_RDWR | O_NONBLOCK);
+                break;
             case '?':
             case 'h':
                 usage(0);
@@ -723,7 +774,7 @@ int main(int argc, char *argv[])
 
     video_st = add_video_stream(oc, fmt->video_codec);
     audio_st = add_audio_stream(oc, fmt->audio_codec);
-
+    if (serial_fd > 0) data_st = add_data_stream(oc, CODEC_ID_TEXT);
     av_set_parameters(oc, NULL);
 
     if (!(fmt->flags & AVFMT_NOFILE)) {
